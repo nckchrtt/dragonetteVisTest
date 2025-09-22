@@ -1,0 +1,13 @@
+name: wyvern_viz_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - rasterio
+  - jupyter
+  - requests
+  - matplotlib
+  - pystac
+  - numpy
+  - gdal=3.10

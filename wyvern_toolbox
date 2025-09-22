@@ -1,0 +1,359 @@
+import os
+import requests
+import rasterio
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider
+from matplotlib.patches import Rectangle
+import json
+
+# --- Configuration ---
+# Directory for storing the downloaded GeoTIFF file.
+DOWNLOAD_DIR = "C:/Users/nnn_s/Downloads/dragonette/"
+
+# Default bands to display initially. These are chosen to approximate a
+# natural color view. We use 1-based indexing for user display.
+INITIAL_BANDS = {
+    'red': 10,
+    'green': 4,
+    'blue': 0,
+}
+
+def create_download_dir(directory):
+    """Create the directory for storing downloads if it doesn't exist."""
+    if not os.path.exists(directory):
+        print(f"Creating directory: {directory}")
+        os.makedirs(directory)
+
+def get_asset_info_from_stac_url(stac_json_url, download_directory=DOWNLOAD_DIR):
+    """
+    Fetches a STAC Item JSON file, saves it, and extracts the GeoTIFF asset URL.
+    """
+    print(f"Fetching STAC metadata from: {stac_json_url}")
+    try:
+        # Fetch the JSON metadata
+        response = requests.get(stac_json_url)
+        response.raise_for_status()
+        stac_item = response.json()
+
+        # Save the JSON metadata file to the specified download directory
+        json_filename = os.path.basename(stac_json_url)
+        json_filepath = os.path.join(download_directory, json_filename)
+        if os.path.exists(json_filepath):
+            print(f"STAC metadata file already exists. Reading from: {json_filepath}")
+            with open(json_filepath, 'r') as f:
+                stac_item = json.load(f)
+        else:
+            print(f"Fetching STAC metadata from: {stac_json_url}")
+            # Fetch the JSON metadata
+            response = requests.get(stac_json_url)
+            response.raise_for_status()
+            stac_item = response.json()
+
+            # Save the JSON metadata file to the specified download directory
+            with open(json_filepath, 'w') as f:
+                json.dump(stac_item, f, indent=4)
+            print(f"STAC metadata saved to: {json_filepath}")
+
+        print(f"Found STAC Item: {stac_item.get('id', 'N/A')}")
+
+        # Find the main GeoTIFF data asset. We look for an asset that has the 'data' role
+        # and is a cloud-optimized geotiff.
+        geotiff_asset = None
+        for asset_key, asset in stac_item.get('assets', {}).items():
+            asset_type = asset.get('type', '')
+            asset_roles = asset.get('roles', [])
+            
+            # Check if it's the primary data and is a cloud-optimized format
+            if 'data' in asset_roles and 'cloud-optimized' in asset_type:
+                geotiff_asset = asset
+                print(f"Found Cloud Optimized GeoTIFF data asset: '{asset_key}'")
+                break
+        
+        if not geotiff_asset:
+            print("Could not find a Cloud Optimized GeoTIFF data asset in the STAC item.")
+            return None, None
+            
+        asset_url = geotiff_asset['href']
+        filename = os.path.basename(asset_url)
+        return asset_url, filename
+
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to fetch or parse STAC JSON URL: {e}")
+        return None, None
+    except json.JSONDecodeError:
+        print("Failed to decode JSON from the provided URL.")
+        return None, None
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return None, None
+
+def find_tiff_filename_from_stac(stac_item):
+    """Parses a loaded STAC item to find the filename of the COG asset."""
+    geotiff_asset = None
+    for asset_key, asset in stac_item.get('assets', {}).items():
+        asset_type = asset.get('type', '')
+        asset_roles = asset.get('roles', [])
+        if 'data' in asset_roles and 'cloud-optimized' in asset_type:
+            geotiff_asset = asset
+            break
+    
+    if geotiff_asset:
+        href = geotiff_asset.get('href', '')
+        return os.path.basename(href)
+    
+    return None
+
+def download_file(url, filename, download_directory):
+    """Downloads a large file with a progress bar."""
+    filepath = os.path.join(download_directory, filename)
+    if os.path.exists(filepath):
+        print(f"File already exists: {filepath}")
+        return filepath
+
+    print(f"Downloading {filename}...")
+    print("This is a large file and may take several minutes.")
+    try:
+        with requests.get(url, stream=True) as r:
+            r.raise_for_status()
+            total_size = int(r.headers.get('content-length', 0))
+            bytes_downloaded = 0
+            with open(filepath, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    bytes_downloaded += len(chunk)
+                    done = int(50 * bytes_downloaded / total_size) if total_size > 0 else 0
+                    print(f"\r[{'=' * done}{' ' * (50-done)}] {bytes_downloaded/1e6:.2f} / {total_size/1e6:.2f} MB", end='')
+        print(f"\nSuccessfully downloaded to {filepath}")
+        return filepath
+    except requests.exceptions.RequestException as e:
+        print(f"\nError downloading file: {e}")
+        return None
+    
+def integer_normalize(band_array, num_values=256):
+    """Normalizes a float array to 0-(num_values-1) for display."""
+    max_val = band_array.max()
+    if max_val == 0:
+        max_val = 1  # Avoid division by zero
+    return (band_array / max_val * (num_values - 1)).astype(np.uint8)
+
+def read_image(filepath):
+    """Reads an image file and returns its data as a NumPy array."""
+    try:
+        print("Opening file. This may take a moment...")
+        with rasterio.open(filepath) as src:
+            image_cube = src.read()
+            num_bands, height, width = image_cube.shape
+            print(f"Image loaded: {width}x{height} pixels with {num_bands} bands.")
+            
+            # Try to print band descriptions if they exist
+            if src.descriptions and all(src.descriptions):
+                print(f"Image loaded: {width}x{height} pixels with {num_bands} bands.")
+                print(f"Image bands: {', '.join(src.descriptions)}")
+            return image_cube
+    except Exception as e:
+        print(f"Failed to read file: {e}")
+        return None
+
+def create_interactive_viewer(image_cube, filename):
+    """
+    Displays a hyperspectral image array with sliders and a spectral plot.
+    """
+    if image_cube is None:
+        print("Image data is not valid. Cannot create viewer.")
+        return
+
+    num_bands, height, width = image_cube.shape
+
+    # Pre-normalize the entire image cube for faster updates.
+    print("Normalizing image data for display...")
+    normalized_cube = np.zeros_like(image_cube, dtype=np.uint8)
+    for i in range(num_bands):
+        normalized_cube[i, :, :] = integer_normalize(image_cube[i, :, :])
+    print("Normalization complete.")
+
+    # Create a figure with two subplots: one for the image, one for the spectrum
+    fig, (ax_image, ax_spectrum) = plt.subplots(1, 2, figsize=(12, 7), 
+                                                gridspec_kw={'width_ratios': [3, 1]})
+    plt.subplots_adjust(bottom=0.25)
+
+    # --- Configure the main image display subplot ---
+    ax_image.set_title(f'{filename}\n(Click on a pixel to view its spectrum)')
+    ax_image.axis('off')
+    image_display = ax_image.imshow(np.zeros((height, width, 3), dtype=np.uint8))
+
+    # --- Configure the spectral plot subplot ---
+    ax_spectrum.set_title("Pixel Spectrum")
+    ax_spectrum.set_xlabel("Band Number")
+    ax_spectrum.set_ylabel("Raw Value")
+    spectrum_line, = ax_spectrum.plot([], []) # Initial empty line
+    ax_spectrum.set_xlim(1, num_bands)
+    ax_spectrum.grid(True)
+
+    # Set an initial y-limit for the spectrum plot based on the image data type
+    if np.issubdtype(image_cube.dtype, np.integer):
+        dtype_info = np.iinfo(image_cube.dtype)
+        ax_spectrum.set_ylim(dtype_info.min, dtype_info.max)
+
+    # --- Configure the sliders ---
+    ax_red = plt.axes([0.15, 0.1, 0.5, 0.03])
+    ax_green = plt.axes([0.15, 0.05, 0.5, 0.03])
+    ax_blue = plt.axes([0.15, 0.0, 0.5, 0.03])
+
+    slider_red = Slider(
+        ax=ax_red, label='Red Band', valmin=1, valmax=num_bands,
+        valinit=INITIAL_BANDS['red'], valstep=1, color='red'
+    )
+    slider_green = Slider(
+        ax=ax_green, label='Green Band', valmin=1, valmax=num_bands,
+        valinit=INITIAL_BANDS['green'], valstep=1, color='green'
+    )
+    slider_blue = Slider(
+        ax=ax_blue, label='Blue Band', valmin=1, valmax=num_bands,
+        valinit=INITIAL_BANDS['blue'], valstep=1, color='blue'
+    )
+
+    def update_image_display(val):
+        """Function to be called when a slider value is changed."""
+        r_band_idx = int(slider_red.val) - 1
+        g_band_idx = int(slider_green.val) - 1
+        b_band_idx = int(slider_blue.val) - 1
+
+        r_norm = normalized_cube[r_band_idx, :, :]
+        g_norm = normalized_cube[g_band_idx, :, :]
+        b_norm = normalized_cube[b_band_idx, :, :]
+
+        rgb_image = np.dstack((r_norm, g_norm, b_norm))
+        image_display.set_data(rgb_image)
+        fig.canvas.draw_idle()
+
+    slider_red.on_changed(update_image_display)
+    slider_green.on_changed(update_image_display)
+    slider_blue.on_changed(update_image_display)
+    
+    # Variable to store the selection box patch
+    selected_pixel_box = None
+    
+    def on_pixel_click(event):
+        """Callback function to handle mouse clicks on the image."""
+        nonlocal selected_pixel_box
+        if event.inaxes == ax_image and event.button == 1:
+            x = int(event.xdata)
+            y = int(event.ydata)
+
+            if 0 <= x < width and 0 <= y < height:
+                pixel_spectrum = image_cube[:, y, x]
+                
+                # Update console
+                print("\n" + "="*40)
+                print(f"Spectral data for pixel at (x={x}, y={y}):")
+                print(pixel_spectrum)
+                print("="*40)
+                
+                # Update the spectral plot
+                band_numbers = np.arange(1, num_bands + 1)
+                spectrum_line.set_data(band_numbers, pixel_spectrum)
+                ax_spectrum.relim()
+                ax_spectrum.autoscale_view(True, True, True)
+
+                # Remove the old selection box if it exists
+                if selected_pixel_box:
+                    selected_pixel_box.remove()
+
+                # Create and add a new selection box
+                rect = Rectangle((x - 0.5, y - 0.5), 1, 1, 
+                                linewidth=1, edgecolor='r', facecolor='none')
+                ax_image.add_patch(rect)
+                selected_pixel_box = rect
+                
+                fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect('button_press_event', on_pixel_click)
+
+    update_image_display(None)
+    plt.show()
+
+def float_normalize(band_array, num_values=256):
+    """Normalizes a float array to 0-(num_values-1)."""
+    max_val = band_array.max()
+    if max_val == 0:
+        max_val = 1  # Avoid division by zero
+    return (band_array / max_val * (num_values - 1)).astype(np.uint8)
+
+def main():
+    """Main function to run the application."""
+    print("--- Interactive Hyperspectral Viewer ---")
+    create_download_dir(DOWNLOAD_DIR)
+    
+    asset_url = None
+    filename = None
+    
+    # Prompt user for their choice of input
+    choice = input("Select data source: (L)ocal file or (U)RL? ").lower()
+
+    if choice == 'u':
+        stac_url = input("Please enter the URL to a STAC Item .json file: ")
+        if not stac_url:
+            print("No URL provided. Exiting.")
+            return
+        asset_url, filename = get_asset_info_from_stac_url(stac_url, DOWNLOAD_DIR)
+        if not filename:
+            print("Could not process the STAC URL. Exiting.")
+            return
+
+    elif choice == 'l':
+        try:
+            json_files = [f for f in os.listdir(DOWNLOAD_DIR) if f.endswith('.json')]
+            if not json_files:
+                print(f"No .json files found in '{DOWNLOAD_DIR}'. Please use the URL option first.")
+                return
+
+            print("\nAvailable local STAC files:")
+            for i, fname in enumerate(json_files):
+                print(f"  {i+1}: {fname}")
+            
+            file_choice = int(input(f"Select a file number (1-{len(json_files)}): ")) - 1
+            if not 0 <= file_choice < len(json_files):
+                raise ValueError("Choice out of range.")
+            
+            selected_json = json_files[file_choice]
+            print(f"Using local file: {selected_json}")
+            json_path = os.path.join(DOWNLOAD_DIR, selected_json)
+            with open(json_path, 'r') as f:
+                stac_item = json.load(f)
+            
+            filename = find_tiff_filename_from_stac(stac_item)
+            if not filename:
+                print("Could not find a valid GeoTIFF asset in the selected JSON file.")
+                return
+
+        except (ValueError, IndexError):
+            print("Invalid selection. Exiting.")
+            return
+
+    else:
+        print("Invalid choice. Please enter 'L' or 'U'. Exiting.")
+        return
+
+    # Proceed with download (if necessary) and viewing
+    filepath = os.path.join(DOWNLOAD_DIR, filename)
+    
+    # If we got a URL and the file doesn't exist, prompt for download.
+    if asset_url and not os.path.exists(filepath):
+        dl_choice = input(f"STAC item found. Download {filename}? (y/n): ").lower()
+        if dl_choice == 'y':
+            filepath = download_file(asset_url, filename, DOWNLOAD_DIR)
+        else:
+            print("Cannot start viewer without data file. Exiting.")
+            return
+    
+    # Check if the final filepath is valid and exists before viewing
+    if filepath and os.path.exists(filepath):
+        hyper_cube = read_image(filepath)
+        if hyper_cube is not None:
+            create_interactive_viewer(hyper_cube, os.path.basename(filepath))
+    else:
+        print(f"Image file '{filename}' not found locally. Please use the URL option to download it.")
+
+if __name__ == "__main__":
+    main()
