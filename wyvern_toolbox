@@ -9,7 +9,7 @@ import json
 
 # --- Configuration ---
 # Directory for storing the downloaded GeoTIFF file.
-DOWNLOAD_DIR = "C:/Users/nnn_s/Downloads/dragonette/"
+DOWNLOAD_DIR = "F:/dragonette"
 
 # Default bands to display initially. These are chosen to approximate a
 # natural color view. We use 1-based indexing for user display.
@@ -27,18 +27,14 @@ def create_download_dir(directory):
 
 def get_asset_info_from_stac_url(stac_json_url, download_directory=DOWNLOAD_DIR):
     """
-    Fetches a STAC Item JSON file, saves it, and extracts the GeoTIFF asset URL.
+    Fetches a STAC Item JSON file if not present locally, saves it, 
+    and extracts the GeoTIFF asset URL.
     """
-    print(f"Fetching STAC metadata from: {stac_json_url}")
     try:
-        # Fetch the JSON metadata
-        response = requests.get(stac_json_url)
-        response.raise_for_status()
-        stac_item = response.json()
-
-        # Save the JSON metadata file to the specified download directory
         json_filename = os.path.basename(stac_json_url)
         json_filepath = os.path.join(download_directory, json_filename)
+
+        # Check if the JSON file already exists locally
         if os.path.exists(json_filepath):
             print(f"STAC metadata file already exists. Reading from: {json_filepath}")
             with open(json_filepath, 'r') as f:
@@ -74,8 +70,12 @@ def get_asset_info_from_stac_url(stac_json_url, download_directory=DOWNLOAD_DIR)
             print("Could not find a Cloud Optimized GeoTIFF data asset in the STAC item.")
             return None, None
             
-        asset_url = geotiff_asset['href']
-        filename = os.path.basename(asset_url)
+        # IMPORTANT: We must resolve the relative href from the STAC item to an absolute URL
+        from urllib.parse import urljoin
+        relative_href = geotiff_asset['href']
+        asset_url = urljoin(stac_json_url, relative_href)
+        
+        filename = os.path.basename(relative_href)
         return asset_url, filename
 
     except requests.exceptions.RequestException as e:
@@ -88,21 +88,6 @@ def get_asset_info_from_stac_url(stac_json_url, download_directory=DOWNLOAD_DIR)
         print(f"An unexpected error occurred: {e}")
         return None, None
 
-def find_tiff_filename_from_stac(stac_item):
-    """Parses a loaded STAC item to find the filename of the COG asset."""
-    geotiff_asset = None
-    for asset_key, asset in stac_item.get('assets', {}).items():
-        asset_type = asset.get('type', '')
-        asset_roles = asset.get('roles', [])
-        if 'data' in asset_roles and 'cloud-optimized' in asset_type:
-            geotiff_asset = asset
-            break
-    
-    if geotiff_asset:
-        href = geotiff_asset.get('href', '')
-        return os.path.basename(href)
-    
-    return None
 
 def download_file(url, filename, download_directory):
     """Downloads a large file with a progress bar."""
@@ -129,26 +114,66 @@ def download_file(url, filename, download_directory):
     except requests.exceptions.RequestException as e:
         print(f"\nError downloading file: {e}")
         return None
+
+def find_tiff_filename_from_stac(stac_item):
+    """Parses a loaded STAC item to find the filename of the COG asset."""
+    geotiff_asset = None
+    for asset_key, asset in stac_item.get('assets', {}).items():
+        asset_type = asset.get('type', '')
+        asset_roles = asset.get('roles', [])
+        if 'data' in asset_roles and 'cloud-optimized' in asset_type:
+            geotiff_asset = asset
+            break
     
+    if geotiff_asset:
+        href = geotiff_asset.get('href', '')
+        return os.path.basename(href)
+    
+    return None
+
 def integer_normalize(band_array, num_values=256):
-    """Normalizes a float array to 0-(num_values-1) for display."""
-    max_val = band_array.max()
-    if max_val == 0:
-        max_val = 1  # Avoid division by zero
-    return (band_array / max_val * (num_values - 1)).astype(np.uint8)
+    """
+    Normalizes an array to 0-(num_values-1) for display, correctly handling NaNs.
+    """
+    # Use nanmax to find the max value, ignoring potential NaN values.
+    max_val = np.nanmax(band_array)
+    
+    # Handle cases where the band is all zeros or all NaNs.
+    if max_val == 0 or np.isnan(max_val):
+        max_val = 1  # Avoid division by zero.
+        
+    # Perform scaling. NaNs will remain NaNs.
+    normalized = (band_array / max_val * (num_values - 1))
+    
+    # Convert NaNs to 0 (black pixels) and then cast to integer type.
+    return np.nan_to_num(normalized, nan=0).astype(np.uint8)
 
 def read_image(filepath):
-    """Reads an image file and returns its data as a NumPy array."""
+    """
+    Reads an image file, replacing no-data values with NaN, and returns 
+    its data as a NumPy array.
+    """
     try:
         print("Opening file. This may take a moment...")
         with rasterio.open(filepath) as src:
+            # Get the no-data value from the file's metadata
+            nodata_val = src.nodata
+
+            # Read all bands into the image cube
             image_cube = src.read()
+            
+            if nodata_val is not None:
+                print(f"Found no-data value: {nodata_val}. Masking for display.")
+                # Convert to a float type that supports NaN if not already
+                if image_cube.dtype != np.float32 and image_cube.dtype != np.float64:
+                    image_cube = image_cube.astype(np.float32)
+                # Replace the no-data value with Not a Number (NaN)
+                image_cube[image_cube == nodata_val] = np.nan
+
             num_bands, height, width = image_cube.shape
             print(f"Image loaded: {width}x{height} pixels with {num_bands} bands.")
             
-            # Try to print band descriptions if they exist
             if src.descriptions and all(src.descriptions):
-                print(f"Image loaded: {width}x{height} pixels with {num_bands} bands.")
                 print(f"Image bands: {', '.join(src.descriptions)}")
             return image_cube
     except Exception as e:
@@ -167,7 +192,7 @@ def create_interactive_viewer(image_cube, filename):
 
     # Pre-normalize the entire image cube for faster updates.
     print("Normalizing image data for display...")
-    normalized_cube = np.zeros_like(image_cube, dtype=np.uint8)
+    normalized_cube = np.zeros((num_bands, height, width), dtype=np.uint8)
     for i in range(num_bands):
         normalized_cube[i, :, :] = integer_normalize(image_cube[i, :, :])
     print("Normalization complete.")
@@ -233,7 +258,7 @@ def create_interactive_viewer(image_cube, filename):
     
     # Variable to store the selection box patch
     selected_pixel_box = None
-    
+
     def on_pixel_click(event):
         """Callback function to handle mouse clicks on the image."""
         nonlocal selected_pixel_box
@@ -262,7 +287,7 @@ def create_interactive_viewer(image_cube, filename):
 
                 # Create and add a new selection box
                 rect = Rectangle((x - 0.5, y - 0.5), 1, 1, 
-                                linewidth=1, edgecolor='r', facecolor='none')
+                                 linewidth=1, edgecolor='r', facecolor='none')
                 ax_image.add_patch(rect)
                 selected_pixel_box = rect
                 
@@ -272,13 +297,6 @@ def create_interactive_viewer(image_cube, filename):
 
     update_image_display(None)
     plt.show()
-
-def float_normalize(band_array, num_values=256):
-    """Normalizes a float array to 0-(num_values-1)."""
-    max_val = band_array.max()
-    if max_val == 0:
-        max_val = 1  # Avoid division by zero
-    return (band_array / max_val * (num_values - 1)).astype(np.uint8)
 
 def main():
     """Main function to run the application."""
@@ -355,5 +373,7 @@ def main():
     else:
         print(f"Image file '{filename}' not found locally. Please use the URL option to download it.")
 
+
 if __name__ == "__main__":
     main()
+
