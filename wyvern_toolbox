@@ -9,14 +9,14 @@ import json
 
 # --- Configuration ---
 # Directory for storing the downloaded GeoTIFF file.
-DOWNLOAD_DIR = "C:/dragonette"
+DOWNLOAD_DIR = "C:/satelliteImagery/dragonette"
 
 # Default bands to display initially. These are chosen to approximate a
 # natural color view. We use 1-based indexing for user display.
 INITIAL_BANDS = {
-    'red': 19,
-    'green': 10,
-    'blue': 4,
+    'red': 5,
+    'green': 3,
+    'blue': 2,
 }
 
 def create_download_dir(directory):
